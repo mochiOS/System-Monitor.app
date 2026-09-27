@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "system-monitor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+appkit = { package = "mochios-appkit", path = "../../tools/devkit/crates/appkit" }
+
+[target.'cfg(target_os = "mochios")'.dependencies]
+mochi-user-syscall = { git = "https://github.com/mochiOS/syscalls", package = "mochi-user-syscall" }
+
+[[bin]]
+name = "system-monitor"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("mochios"))'] }
