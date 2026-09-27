@@ -1,6 +1,9 @@
 mod processes;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use appkit::prelude::*;
@@ -16,17 +19,15 @@ const HEADER_HEIGHT: f32 = 38.0;
 struct SystemMonitorApp {
     category: State<usize>,
     search: State<String>,
-    refresh_generation: State<usize>,
 }
 
 impl App for SystemMonitorApp {
-    type Body = ApplicationMenuBar<Box<dyn View + 'static>>;
+    type Body = Box<dyn View + 'static>;
 
     fn new() -> Self {
         Self {
             category: State::new(0),
             search: State::new(String::new()),
-            refresh_generation: State::new(0),
         }
     }
 
@@ -37,8 +38,6 @@ impl App for SystemMonitorApp {
     }
 
     fn body(&self, _context: &ViewContext) -> Self::Body {
-        let menu_refresh = self.refresh_generation.clone();
-        let view_refresh = self.refresh_generation.clone();
         let content: Box<dyn View + 'static> = Box::new(
             VStack::new()
                 .alignment(StackAlignment::Stretch)
@@ -70,53 +69,26 @@ impl App for SystemMonitorApp {
                 )
                 .child(Divider::new())
                 .child(
-                    MonitorView::new(
-                        self.category.clone(),
-                        self.search.clone(),
-                        self.refresh_generation.clone(),
-                    )
-                    .layout()
-                    .flex_grow(1.0),
+                    MonitorView::new(self.category.clone(), self.search.clone())
+                        .layout()
+                        .flex_grow(1.0),
                 ),
         );
 
-        ApplicationMenuBar::new(content)
-            .menu(
-                ApplicationMenu::new("System Monitor")
-                    .item(
-                        ApplicationMenuItem::new("Refresh Now", move || {
-                            menu_refresh.set(menu_refresh.get().wrapping_add(1));
-                        })
-                        .shortcut(MenuShortcut::command('r', "Ctrl+R")),
-                    )
-                    .separator()
-                    .item(
-                        ApplicationMenuItem::new("Quit System Monitor", request_quit)
-                            .shortcut(MenuShortcut::command('q', "Ctrl+Q")),
-                    ),
-            )
-            .menu(
-                ApplicationMenu::new("View").item(
-                    ApplicationMenuItem::new("Refresh", move || {
-                        view_refresh.set(view_refresh.get().wrapping_add(1));
-                    })
-                    .shortcut(MenuShortcut::command('r', "Ctrl+R")),
-                ),
-            )
-            .menu(
-                ApplicationMenu::new("Window").item(
-                    ApplicationMenuItem::new("Close Window", request_close_key_window)
-                        .shortcut(MenuShortcut::command('w', "Ctrl+W")),
-                ),
-            )
+        content
     }
+}
+
+#[derive(Clone)]
+struct ApplicationPresentation {
+    name: String,
+    icon: Option<ImageData>,
 }
 
 struct MonitorView {
     category: State<usize>,
     search: State<String>,
-    refresh_generation: State<usize>,
-    observed_generation: Cell<usize>,
+    applications: HashMap<String, ApplicationPresentation>,
     processes: RefCell<Vec<ProcessInfo>>,
     error: RefCell<Option<String>>,
     last_refresh: Cell<Option<Instant>>,
@@ -125,12 +97,11 @@ struct MonitorView {
 }
 
 impl MonitorView {
-    fn new(category: State<usize>, search: State<String>, refresh: State<usize>) -> Self {
+    fn new(category: State<usize>, search: State<String>) -> Self {
         Self {
             category,
             search,
-            observed_generation: Cell::new(refresh.get()),
-            refresh_generation: refresh,
+            applications: load_applications(),
             processes: RefCell::new(Vec::new()),
             error: RefCell::new(None),
             last_refresh: Cell::new(None),
@@ -141,12 +112,11 @@ impl MonitorView {
 
     fn refresh(&self, bounds: Rect, context: &mut PaintContext<'_>) {
         let now = Instant::now();
-        let generation = self.refresh_generation.get();
         let due = self
             .last_refresh
             .get()
             .and_then(|last| last.checked_add(REFRESH_INTERVAL));
-        if generation != self.observed_generation.get() || due.is_none_or(|due| due <= now) {
+        if due.is_none_or(|due| due <= now) {
             match processes::snapshot() {
                 Ok(snapshot) => {
                     *self.processes.borrow_mut() = snapshot;
@@ -154,7 +124,6 @@ impl MonitorView {
                 }
                 Err(error) => *self.error.borrow_mut() = Some(error.to_string()),
             }
-            self.observed_generation.set(generation);
             self.last_refresh.set(Some(now));
         }
         context.request_redraw_in_at(
@@ -165,16 +134,39 @@ impl MonitorView {
 
     fn filtered(&self) -> Vec<ProcessInfo> {
         let query = self.search.get().trim().to_lowercase();
-        self.processes
+        let mut processes = self
+            .processes
             .borrow()
             .iter()
             .filter(|item| {
+                let application_name = self
+                    .applications
+                    .get(&item.name)
+                    .map(|application| application.name.to_lowercase());
                 query.is_empty()
                     || item.name.to_lowercase().contains(&query)
+                    || application_name.is_some_and(|name| name.contains(&query))
                     || item.pid.to_string().contains(&query)
             })
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        processes.sort_by(|left, right| {
+            let left_name = self
+                .applications
+                .get(&left.name)
+                .map(|application| application.name.as_str())
+                .unwrap_or(&left.name);
+            let right_name = self
+                .applications
+                .get(&right.name)
+                .map(|application| application.name.as_str())
+                .unwrap_or(&right.name);
+            left_name
+                .to_lowercase()
+                .cmp(&right_name.to_lowercase())
+                .then(left.pid.cmp(&right.pid))
+        });
+        processes
     }
 
     fn geometry(bounds: Rect) -> (Rect, Rect) {
@@ -329,26 +321,49 @@ impl MonitorView {
                     );
             }
 
+            let presentation = self.applications.get(&process.name);
+            let display_name = presentation
+                .map(|application| application.name.as_str())
+                .unwrap_or(&process.name);
+            let icon_bounds = Rect::new(table.origin.x + 20.0, y + 8.0, 27.0, 27.0);
+            if let Some(icon) = presentation.and_then(|application| application.icon.clone()) {
+                Image::new(icon)
+                    .content_mode(ImageContentMode::Fit)
+                    .radius(CornerRadius::Small)
+                    .paint(icon_bounds, context);
+            } else {
+                ApplicationPlaceholder::new(display_name).paint(icon_bounds, context);
+            }
+            Text::styled(display_name, TextRole::Label)
+                .color(if self.selected_pid.get() == Some(process.pid) {
+                    theme.shell.action
+                } else {
+                    theme.shell.primary_text
+                })
+                .paint(
+                    Rect::new(
+                        table.origin.x + 57.0,
+                        y + 10.0,
+                        table.size.width * widths[0] - 77.0,
+                        22.0,
+                    ),
+                    context,
+                );
+
             let values = [
-                process.name.clone(),
                 "—".to_owned(),
                 "—".to_owned(),
                 "—".to_owned(),
                 process.pid.to_string(),
                 process.state.label().to_owned(),
             ];
-            let mut x = table.origin.x + 20.0;
-            for (index, value) in values.into_iter().enumerate() {
+            let mut x = table.origin.x + 20.0 + table.size.width * widths[0];
+            for (offset, value) in values.into_iter().enumerate() {
+                let index = offset + 1;
                 let width = table.size.width * widths[index];
                 let state_inset = if index == 5 { 16.0 } else { 0.0 };
                 Text::styled(value, TextRole::Label)
-                    .color(
-                        if index == 0 && self.selected_pid.get() == Some(process.pid) {
-                            theme.shell.action
-                        } else {
-                            theme.shell.primary_text
-                        },
-                    )
+                    .color(theme.shell.primary_text)
                     .paint(
                         Rect::new(x + state_inset, y + 10.0, width - 20.0, 22.0),
                         context,
@@ -461,4 +476,51 @@ impl View for MonitorView {
 
 fn main() -> Result<(), appkit::ViewKitError> {
     appkit::run::<SystemMonitorApp>()
+}
+
+fn load_applications() -> HashMap<String, ApplicationPresentation> {
+    let mut applications = HashMap::new();
+    for root in [Path::new("/applications")] {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let app_root = entry.path();
+            if app_root.extension().and_then(|value| value.to_str()) != Some("app") {
+                continue;
+            }
+            let Ok(manifest) = fs::read_to_string(app_root.join("manifest.toml")) else {
+                continue;
+            };
+            let (Some(id), Some(name)) = (
+                manifest_string(&manifest, "id"),
+                manifest_string(&manifest, "name"),
+            ) else {
+                continue;
+            };
+            let icon = manifest_string(&manifest, "icon")
+                .map(|relative| app_root.join(relative))
+                .and_then(|path| load_icon(&path));
+            applications
+                .entry(id)
+                .or_insert(ApplicationPresentation { name, icon });
+        }
+    }
+    applications
+}
+
+fn manifest_string(manifest: &str, key: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        (candidate.trim() == key).then(|| value.trim().trim_matches('"').to_owned())
+    })
+}
+
+fn load_icon(path: &Path) -> Option<ImageData> {
+    if path.extension().and_then(|value| value.to_str()) == Some("svg") {
+        let svg = SvgData::from_path(path).ok()?;
+        ImageData::from_svg(&svg, 54, 54).ok()
+    } else {
+        ImageData::thumbnail_from_path(path, 54, 54).ok()
+    }
 }

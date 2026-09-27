@@ -21,6 +21,7 @@ resources = ["appicon.png"]
 path = "/applications/SystemMonitor.app/entry.elf"
 kind = "application"
 requires = [
+    "fs.read.applications",
     "ipc.client",
     "ipc.server",
     "window.create",
