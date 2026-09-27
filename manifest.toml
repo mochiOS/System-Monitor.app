@@ -18,7 +18,7 @@ icon = "appicon.png"
 resources = ["appicon.png"]
 
 [[binary]]
-path = "/applications/System Monitor.app/entry.elf"
+path = "/applications/SystemMonitor.app/entry.elf"
 kind = "application"
 requires = [
     "ipc.client",
