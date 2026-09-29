@@ -670,14 +670,31 @@ fn load_applications() -> HashMap<String, ApplicationPresentation> {
             };
             let bundle_name = entry.file_name().to_string_lossy().into_owned();
             let name = if bundle_name.ends_with(".app") {
-                bundle_name
+                bundle_name.clone()
             } else {
                 format!("{name}.app")
             };
             let icon = manifest_string(&manifest, "icon").map(|relative| app_root.join(relative));
+            let package_bundle_alias = id
+                .rsplit('.')
+                .next()
+                .map(|component| format!("{component}.app"));
+            let presentation = ApplicationPresentation { name, icon };
+
+            // A process can be reported by its signed package ID, by the installed
+            // bundle directory, or by the executable's package-derived `.app`
+            // name. Keep all three spellings tied to the same installed bundle so
+            // the visible name and icon never depend on how the process was
+            // launched.
             applications
                 .entry(id)
-                .or_insert(ApplicationPresentation { name, icon });
+                .or_insert_with(|| presentation.clone());
+            applications
+                .entry(bundle_name)
+                .or_insert_with(|| presentation.clone());
+            if let Some(alias) = package_bundle_alias {
+                applications.entry(alias).or_insert(presentation);
+            }
         }
     }
     applications
