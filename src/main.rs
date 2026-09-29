@@ -704,7 +704,7 @@ fn read_directory_entries(root: &Path) -> io::Result<Vec<fs::DirEntry>> {
     let mut last_error = None;
     for _ in 0..8 {
         match fs::read_dir(root) {
-            Ok(entries) => return entries.collect(),
+            Ok(entries) => return collect_directory_entries(entries),
             Err(error)
                 if matches!(
                     error.kind(),
@@ -717,9 +717,29 @@ fn read_directory_entries(root: &Path) -> io::Result<Vec<fs::DirEntry>> {
             Err(error) => return Err(error),
         }
     }
-    fs::read_dir(root)
-        .and_then(|entries| entries.collect())
-        .or_else(|error| Err(last_error.unwrap_or(error)))
+    match fs::read_dir(root) {
+        Ok(entries) => collect_directory_entries(entries),
+        Err(error) => Err(last_error.unwrap_or(error)),
+    }
+}
+
+fn collect_directory_entries(entries: fs::ReadDir) -> io::Result<Vec<fs::DirEntry>> {
+    let mut collected = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => collected.push(entry),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                transient_pause();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(collected)
 }
 
 fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
