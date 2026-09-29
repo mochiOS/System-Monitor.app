@@ -1,6 +1,6 @@
 use std::io;
 
-pub const RECORD_SIZE: usize = 88;
+pub const RECORD_SIZE: usize = 112;
 #[cfg(target_os = "mochios")]
 const MAX_RECORDS: usize = 512;
 
@@ -23,12 +23,16 @@ impl ProcessState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProcessInfo {
     pub pid: u64,
     pub parent_pid: u64,
     pub name: String,
     pub state: ProcessState,
+    pub cpu_ticks: u64,
+    pub cpu_percent: f32,
+    pub memory_bytes: u64,
+    pub thread_count: u64,
 }
 
 pub fn decode_records(bytes: &[u8], count: usize) -> Vec<ProcessInfo> {
@@ -42,11 +46,14 @@ pub fn decode_records(bytes: &[u8], count: usize) -> Vec<ProcessInfo> {
             }
             let raw_state = u64::from_ne_bytes(record[16..24].try_into().ok()?);
             let parent_pid = u64::from_ne_bytes(record[24..32].try_into().ok()?);
-            let name_end = record[32..]
+            let cpu_ticks = u64::from_ne_bytes(record[32..40].try_into().ok()?);
+            let memory_bytes = u64::from_ne_bytes(record[40..48].try_into().ok()?);
+            let thread_count = u64::from_ne_bytes(record[48..56].try_into().ok()?);
+            let name_end = record[56..]
                 .iter()
                 .position(|byte| *byte == 0)
                 .unwrap_or(56);
-            let name = String::from_utf8_lossy(&record[32..32 + name_end]).into_owned();
+            let name = String::from_utf8_lossy(&record[56..56 + name_end]).into_owned();
             Some(ProcessInfo {
                 pid,
                 parent_pid,
@@ -61,6 +68,10 @@ pub fn decode_records(bytes: &[u8], count: usize) -> Vec<ProcessInfo> {
                     4 => ProcessState::Zombie,
                     other => ProcessState::Unknown(other),
                 },
+                cpu_ticks,
+                cpu_percent: 0.0,
+                memory_bytes,
+                thread_count,
             })
         })
         .collect::<Vec<_>>();
@@ -122,6 +133,16 @@ pub fn snapshot() -> io::Result<Vec<ProcessInfo>> {
             parent_pid,
             name,
             state,
+            cpu_ticks: 0,
+            cpu_percent: 0.0,
+            memory_bytes: field("VmSize:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0)
+                .saturating_mul(1024),
+            thread_count: field("Threads:")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
         });
     }
     processes.sort_by(|left, right| {
@@ -169,7 +190,10 @@ mod tests {
         record[0..8].copy_from_slice(&42u64.to_ne_bytes());
         record[16..24].copy_from_slice(&3u64.to_ne_bytes());
         record[24..32].copy_from_slice(&7u64.to_ne_bytes());
-        record[32..38].copy_from_slice(b"editor");
+        record[32..40].copy_from_slice(&250u64.to_ne_bytes());
+        record[40..48].copy_from_slice(&8_388_608u64.to_ne_bytes());
+        record[48..56].copy_from_slice(&3u64.to_ne_bytes());
+        record[56..62].copy_from_slice(b"editor");
 
         assert_eq!(
             decode_records(&record, 1),
@@ -178,6 +202,10 @@ mod tests {
                 parent_pid: 7,
                 name: "editor".to_owned(),
                 state: ProcessState::Sleeping,
+                cpu_ticks: 250,
+                cpu_percent: 0.0,
+                memory_bytes: 8_388_608,
+                thread_count: 3,
             }]
         );
     }
@@ -187,10 +215,10 @@ mod tests {
         let mut records = [0u8; RECORD_SIZE * 3];
         records[0..8].copy_from_slice(&2u64.to_ne_bytes());
         records[16..24].copy_from_slice(&1u64.to_ne_bytes());
-        records[32..36].copy_from_slice(b"Zulu");
+        records[56..60].copy_from_slice(b"Zulu");
         records[RECORD_SIZE..RECORD_SIZE + 8].copy_from_slice(&1u64.to_ne_bytes());
         records[RECORD_SIZE + 16..RECORD_SIZE + 24].copy_from_slice(&1u64.to_ne_bytes());
-        records[RECORD_SIZE + 32..RECORD_SIZE + 37].copy_from_slice(b"alpha");
+        records[RECORD_SIZE + 56..RECORD_SIZE + 61].copy_from_slice(b"alpha");
 
         let decoded = decode_records(&records, 3);
         assert_eq!(

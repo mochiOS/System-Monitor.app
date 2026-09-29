@@ -13,6 +13,7 @@ use appkit::viewkit::view::{Constraints, MeasureContext, PaintContext};
 use processes::{ProcessInfo, ProcessState};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const KERNEL_TICKS_PER_SECOND: f32 = 500.0;
 const ROW_HEIGHT: f32 = 43.0;
 const HEADER_HEIGHT: f32 = 38.0;
 
@@ -118,7 +119,22 @@ impl MonitorView {
             .and_then(|last| last.checked_add(REFRESH_INTERVAL));
         if due.is_none_or(|due| due <= now) {
             match processes::snapshot() {
-                Ok(snapshot) => {
+                Ok(mut snapshot) => {
+                    let elapsed = self
+                        .last_refresh
+                        .get()
+                        .map(|last| now.saturating_duration_since(last).as_secs_f32())
+                        .unwrap_or(0.0);
+                    if elapsed > 0.0 {
+                        let previous = self.processes.borrow();
+                        for process in &mut snapshot {
+                            if let Some(old) = previous.iter().find(|old| old.pid == process.pid) {
+                                let ticks = process.cpu_ticks.saturating_sub(old.cpu_ticks);
+                                process.cpu_percent =
+                                    ticks as f32 * 100.0 / (KERNEL_TICKS_PER_SECOND * elapsed);
+                            }
+                        }
+                    }
                     *self.processes.borrow_mut() = snapshot;
                     *self.error.borrow_mut() = None;
                 }
@@ -151,6 +167,11 @@ impl MonitorView {
             .cloned()
             .collect::<Vec<_>>();
         processes.sort_by(|left, right| {
+            let category_order = match self.category.get() {
+                0 | 2 => right.cpu_percent.total_cmp(&left.cpu_percent),
+                1 => right.memory_bytes.cmp(&left.memory_bytes),
+                _ => std::cmp::Ordering::Equal,
+            };
             let left_name = self
                 .applications
                 .get(&left.name)
@@ -161,9 +182,8 @@ impl MonitorView {
                 .get(&right.name)
                 .map(|application| application.name.as_str())
                 .unwrap_or(&right.name);
-            left_name
-                .to_lowercase()
-                .cmp(&right_name.to_lowercase())
+            category_order
+                .then_with(|| left_name.to_lowercase().cmp(&right_name.to_lowercase()))
                 .then(left.pid.cmp(&right.pid))
         });
         processes
@@ -207,11 +227,6 @@ impl MonitorView {
         context: &mut PaintContext<'_>,
     ) {
         let theme = Theme::current();
-        Rectangle::new()
-            .color(RectangleColor::Custom(theme.shell.content_background))
-            .radius(CornerRadius::Large)
-            .border(BorderStyle::custom(theme.shell.field_border, 1.0))
-            .paint(bounds, context);
         Text::styled(label, TextRole::Caption)
             .color(theme.shell.secondary_text)
             .paint(
@@ -248,15 +263,10 @@ impl MonitorView {
 
     fn paint_table(&self, table: Rect, context: &mut PaintContext<'_>) {
         let theme = Theme::current();
-        Rectangle::new()
-            .color(RectangleColor::Custom(theme.shell.content_background))
-            .radius(CornerRadius::Large)
-            .border(BorderStyle::custom(theme.shell.field_border, 1.0))
-            .paint(table, context);
         let header = Rect::new(
-            table.origin.x + 1.0,
-            table.origin.y + 1.0,
-            table.size.width - 2.0,
+            table.origin.x,
+            table.origin.y,
+            table.size.width,
             HEADER_HEIGHT,
         );
         Rectangle::new()
@@ -265,7 +275,27 @@ impl MonitorView {
             .paint(header, context);
 
         let widths = [0.37, 0.12, 0.14, 0.11, 0.10, 0.16];
-        let headings = ["Process Name", "% CPU", "Memory", "Threads", "PID", "State"];
+        let headings = match self.category.get() {
+            1 => ["Process Name", "Memory", "% CPU", "Threads", "PID", "State"],
+            2 => ["Process Name", "Impact", "% CPU", "Threads", "PID", "State"],
+            3 => [
+                "Process Name",
+                "Data Read",
+                "Data Written",
+                "Threads",
+                "PID",
+                "State",
+            ],
+            4 => [
+                "Process Name",
+                "Received",
+                "Sent",
+                "Threads",
+                "PID",
+                "State",
+            ],
+            _ => ["Process Name", "% CPU", "Memory", "Threads", "PID", "State"],
+        };
         let mut x = table.origin.x + 20.0;
         for (index, heading) in headings.into_iter().enumerate() {
             let width = table.size.width * widths[index];
@@ -306,19 +336,12 @@ impl MonitorView {
         let start = self.scroll_rows.get().min(filtered.len().saturating_sub(1));
         for (row_index, process) in filtered.iter().skip(start).take(visible).enumerate() {
             let y = table.origin.y + HEADER_HEIGHT + row_index as f32 * ROW_HEIGHT;
-            let row = Rect::new(table.origin.x + 1.0, y, table.size.width - 2.0, ROW_HEIGHT);
+            let row = Rect::new(table.origin.x, y + 2.0, table.size.width, ROW_HEIGHT - 4.0);
             if self.selected_pid.get() == Some(process.pid) {
                 Rectangle::new()
                     .color(RectangleColor::Custom(theme.shell.selection_soft))
+                    .radius(CornerRadius::Medium)
                     .paint(row, context);
-            }
-            if row_index > 0 {
-                Rectangle::new()
-                    .color(RectangleColor::Custom(theme.shell.field_border))
-                    .paint(
-                        Rect::new(table.origin.x + 18.0, y, table.size.width - 36.0, 1.0),
-                        context,
-                    );
             }
 
             let presentation = self.applications.get(&process.name);
@@ -350,10 +373,18 @@ impl MonitorView {
                     context,
                 );
 
+            let cpu = format!("{:.1}%", process.cpu_percent);
+            let memory = format_bytes(process.memory_bytes);
+            let (primary, secondary) = match self.category.get() {
+                1 => (memory, cpu),
+                2 => (energy_impact(process.cpu_percent).to_owned(), cpu),
+                3 | 4 => ("—".to_owned(), "—".to_owned()),
+                _ => (cpu, memory),
+            };
             let values = [
-                "—".to_owned(),
-                "—".to_owned(),
-                "—".to_owned(),
+                primary,
+                secondary,
+                process.thread_count.to_string(),
                 process.pid.to_string(),
                 process.state.label().to_owned(),
             ];
@@ -406,15 +437,127 @@ impl View for MonitorView {
             ))
             .paint(bounds, context);
         let (content, table) = Self::geometry(bounds);
-        let count = self.processes.borrow().len();
+        let processes = self.processes.borrow();
+        let count = processes.len();
+        let total_cpu = processes
+            .iter()
+            .map(|process| process.cpu_percent)
+            .sum::<f32>();
+        let total_memory = processes.iter().fold(0u64, |total, process| {
+            total.saturating_add(process.memory_bytes)
+        });
+        let total_threads = processes.iter().fold(0u64, |total, process| {
+            total.saturating_add(process.thread_count)
+        });
+        let running = processes
+            .iter()
+            .filter(|process| process.state == ProcessState::Running)
+            .count();
+        let largest = processes.iter().max_by_key(|process| process.memory_bytes);
         let gap = 20.0;
         let width = (content.size.width - gap * 3.0) / 4.0;
-        let cards = [
-            ("CPU Load", "—".to_owned(), "Accounting unavailable"),
-            ("Memory", "—".to_owned(), "Accounting unavailable"),
-            ("Processes", count.to_string(), "Live kernel processes"),
-            ("Uptime", Self::uptime(), "Since system start"),
-        ];
+        let cards = match self.category.get() {
+            1 => vec![
+                (
+                    "Mapped Memory",
+                    format_bytes(total_memory),
+                    "Across live processes".to_owned(),
+                ),
+                (
+                    "Largest Process",
+                    largest
+                        .map(|process| format_bytes(process.memory_bytes))
+                        .unwrap_or_else(|| "—".to_owned()),
+                    largest
+                        .map(|process| {
+                            self.applications
+                                .get(&process.name)
+                                .map(|application| application.name.clone())
+                                .unwrap_or_else(|| process.name.clone())
+                        })
+                        .unwrap_or_else(|| "No processes".to_owned()),
+                ),
+                (
+                    "Processes",
+                    count.to_string(),
+                    "Live kernel processes".to_owned(),
+                ),
+                ("Uptime", Self::uptime(), "Since system start".to_owned()),
+            ],
+            2 => vec![
+                (
+                    "Relative Load",
+                    format!("{total_cpu:.1}%"),
+                    "CPU-derived impact".to_owned(),
+                ),
+                (
+                    "Active",
+                    running.to_string(),
+                    "Running processes".to_owned(),
+                ),
+                (
+                    "Threads",
+                    total_threads.to_string(),
+                    "Across all processes".to_owned(),
+                ),
+                ("Uptime", Self::uptime(), "Since system start".to_owned()),
+            ],
+            3 => vec![
+                (
+                    "Data Read",
+                    "—".to_owned(),
+                    "Accounting not available yet".to_owned(),
+                ),
+                (
+                    "Data Written",
+                    "—".to_owned(),
+                    "Accounting not available yet".to_owned(),
+                ),
+                (
+                    "Processes",
+                    count.to_string(),
+                    "Live kernel processes".to_owned(),
+                ),
+                ("Uptime", Self::uptime(), "Since system start".to_owned()),
+            ],
+            4 => vec![
+                (
+                    "Received",
+                    "—".to_owned(),
+                    "Accounting not available yet".to_owned(),
+                ),
+                (
+                    "Sent",
+                    "—".to_owned(),
+                    "Accounting not available yet".to_owned(),
+                ),
+                (
+                    "Processes",
+                    count.to_string(),
+                    "Live kernel processes".to_owned(),
+                ),
+                ("Uptime", Self::uptime(), "Since system start".to_owned()),
+            ],
+            _ => vec![
+                (
+                    "CPU Load",
+                    format!("{total_cpu:.1}%"),
+                    "Across all processors".to_owned(),
+                ),
+                (
+                    "Running",
+                    running.to_string(),
+                    "Active processes".to_owned(),
+                ),
+                (
+                    "Threads",
+                    total_threads.to_string(),
+                    "Across all processes".to_owned(),
+                ),
+                ("Uptime", Self::uptime(), "Since system start".to_owned()),
+            ],
+        };
+        drop(processes);
         for (index, (label, value, detail)) in cards.into_iter().enumerate() {
             Self::card(
                 Rect::new(
@@ -425,12 +568,11 @@ impl View for MonitorView {
                 ),
                 label,
                 value,
-                detail,
+                &detail,
                 context,
             );
         }
         self.paint_table(table, context);
-        let _ = self.category.get();
     }
 
     fn handle_event(
@@ -522,5 +664,31 @@ fn load_icon(path: &Path) -> Option<ImageData> {
         ImageData::from_svg(&svg, 54, 54).ok()
     } else {
         ImageData::thumbnail_from_path(path, 54, 54).ok()
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
+}
+
+fn energy_impact(cpu_percent: f32) -> &'static str {
+    if cpu_percent >= 50.0 {
+        "High"
+    } else if cpu_percent >= 10.0 {
+        "Medium"
+    } else {
+        "Low"
     }
 }
