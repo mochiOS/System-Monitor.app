@@ -7,11 +7,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use appkit::prelude::*;
-use appkit::viewkit::draw_command::ImageSampling;
-use appkit::viewkit::event::{EventContext, EventResult, ViewEvent};
-use appkit::viewkit::platform::PointerButton;
-use appkit::viewkit::view::{Constraints, MeasureContext, PaintContext};
+use appcore::prelude::*;
+use appcore::viewkit::draw_command::ImageSampling;
+use appcore::viewkit::event::{EventContext, EventResult, ViewEvent};
+use appcore::viewkit::platform::PointerButton;
+use appcore::viewkit::view::{Constraints, MeasureContext, PaintContext};
 use processes::{ProcessInfo, ProcessState};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -646,8 +646,8 @@ impl View for MonitorView {
     }
 }
 
-fn main() -> Result<(), appkit::ViewKitError> {
-    appkit::run::<SystemMonitorApp>()
+fn main() -> Result<(), appcore::ViewKitError> {
+    appcore::run::<SystemMonitorApp>()
 }
 
 fn load_applications() -> HashMap<String, ApplicationPresentation> {

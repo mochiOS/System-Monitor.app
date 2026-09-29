@@ -969,7 +969,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mochios-appkit"
+name = "mochios-appcore"
 version = "0.1.0"
 dependencies = [
  "mochi-user-platform",
@@ -2079,7 +2079,7 @@ name = "system-monitor"
 version = "0.1.0"
 dependencies = [
  "mochi-user-syscall",
- "mochios-appkit",
+ "mochios-appcore",
 ]
 
 [[package]]
