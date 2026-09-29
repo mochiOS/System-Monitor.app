@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use appkit::prelude::*;
+use appkit::viewkit::draw_command::ImageSampling;
 use appkit::viewkit::event::{EventContext, EventResult, ViewEvent};
 use appkit::viewkit::platform::PointerButton;
 use appkit::viewkit::view::{Constraints, MeasureContext, PaintContext};
@@ -17,6 +18,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const KERNEL_TICKS_PER_SECOND: f32 = 500.0;
 const ROW_HEIGHT: f32 = 43.0;
 const HEADER_HEIGHT: f32 = 38.0;
+const FALLBACK_APPLICATION_ICON: &str = "/applications/Binder.app/appicon.svg";
 
 struct SystemMonitorApp {
     category: State<usize>,
@@ -372,17 +374,17 @@ impl MonitorView {
                 .map(|application| application.name.as_str())
                 .unwrap_or(&fallback_name);
             let icon_bounds = Rect::new(table.origin.x + 20.0, y + 8.0, 27.0, 27.0);
-            if let Some(icon) = presentation
+            let icon = presentation
                 .as_ref()
                 .and_then(|application| application.icon.as_deref())
                 .and_then(|path| self.application_icon(path))
-            {
+                .or_else(|| self.application_icon(Path::new(FALLBACK_APPLICATION_ICON)));
+            if let Some(icon) = icon {
                 Image::new(icon)
                     .content_mode(ImageContentMode::Fit)
+                    .sampling(ImageSampling::Bicubic)
                     .radius(CornerRadius::Small)
                     .paint(icon_bounds, context);
-            } else {
-                ApplicationPlaceholder::new(display_name).paint(icon_bounds, context);
             }
             Text::styled(display_name, TextRole::Label)
                 .color(if self.selected_pid.get() == Some(process.pid) {
