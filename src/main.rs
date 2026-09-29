@@ -3,7 +3,8 @@ mod processes;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use appkit::prelude::*;
@@ -83,13 +84,14 @@ impl App for SystemMonitorApp {
 #[derive(Clone)]
 struct ApplicationPresentation {
     name: String,
-    icon: Option<ImageData>,
+    icon: Option<PathBuf>,
 }
 
 struct MonitorView {
     category: State<usize>,
     search: State<String>,
-    applications: HashMap<String, ApplicationPresentation>,
+    applications: RefCell<HashMap<String, ApplicationPresentation>>,
+    icon_cache: RefCell<HashMap<PathBuf, ImageData>>,
     processes: RefCell<Vec<ProcessInfo>>,
     error: RefCell<Option<String>>,
     last_refresh: Cell<Option<Instant>>,
@@ -102,7 +104,8 @@ impl MonitorView {
         Self {
             category,
             search,
-            applications: load_applications(),
+            applications: RefCell::new(load_applications()),
+            icon_cache: RefCell::new(HashMap::new()),
             processes: RefCell::new(Vec::new()),
             error: RefCell::new(None),
             last_refresh: Cell::new(None),
@@ -118,6 +121,9 @@ impl MonitorView {
             .get()
             .and_then(|last| last.checked_add(REFRESH_INTERVAL));
         if due.is_none_or(|due| due <= now) {
+            if self.applications.borrow().is_empty() {
+                *self.applications.borrow_mut() = load_applications();
+            }
             match processes::snapshot() {
                 Ok(mut snapshot) => {
                     let elapsed = self
@@ -157,6 +163,7 @@ impl MonitorView {
             .filter(|item| {
                 let application_name = self
                     .applications
+                    .borrow()
                     .get(&item.name)
                     .map(|application| application.name.to_lowercase())
                     .unwrap_or_else(|| fallback_process_name(&item.name).to_lowercase());
@@ -175,11 +182,13 @@ impl MonitorView {
             };
             let left_name = self
                 .applications
+                .borrow()
                 .get(&left.name)
                 .map(|application| application.name.clone())
                 .unwrap_or_else(|| fallback_process_name(&left.name));
             let right_name = self
                 .applications
+                .borrow()
                 .get(&right.name)
                 .map(|application| application.name.clone())
                 .unwrap_or_else(|| fallback_process_name(&right.name));
@@ -260,6 +269,17 @@ impl MonitorView {
             ),
             context,
         );
+    }
+
+    fn application_icon(&self, path: &Path) -> Option<ImageData> {
+        if let Some(icon) = self.icon_cache.borrow().get(path) {
+            return Some(icon.clone());
+        }
+        let icon = load_icon(path)?;
+        self.icon_cache
+            .borrow_mut()
+            .insert(path.to_path_buf(), icon.clone());
+        Some(icon)
     }
 
     fn paint_table(&self, table: Rect, context: &mut PaintContext<'_>) {
@@ -345,13 +365,18 @@ impl MonitorView {
                     .paint(row, context);
             }
 
-            let presentation = self.applications.get(&process.name);
+            let presentation = self.applications.borrow().get(&process.name).cloned();
             let fallback_name = fallback_process_name(&process.name);
             let display_name = presentation
+                .as_ref()
                 .map(|application| application.name.as_str())
                 .unwrap_or(&fallback_name);
             let icon_bounds = Rect::new(table.origin.x + 20.0, y + 8.0, 27.0, 27.0);
-            if let Some(icon) = presentation.and_then(|application| application.icon.clone()) {
+            if let Some(icon) = presentation
+                .as_ref()
+                .and_then(|application| application.icon.as_deref())
+                .and_then(|path| self.application_icon(path))
+            {
                 Image::new(icon)
                     .content_mode(ImageContentMode::Fit)
                     .radius(CornerRadius::Small)
@@ -473,6 +498,7 @@ impl View for MonitorView {
                     largest
                         .map(|process| {
                             self.applications
+                                .borrow()
                                 .get(&process.name)
                                 .map(|application| application.name.clone())
                                 .unwrap_or_else(|| fallback_process_name(&process.name))
@@ -625,15 +651,15 @@ fn main() -> Result<(), appkit::ViewKitError> {
 fn load_applications() -> HashMap<String, ApplicationPresentation> {
     let mut applications = HashMap::new();
     for root in [Path::new("/applications")] {
-        let Ok(entries) = fs::read_dir(root) else {
+        let Ok(entries) = read_directory_entries(root) else {
             continue;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
             let app_root = entry.path();
             if app_root.extension().and_then(|value| value.to_str()) != Some("app") {
                 continue;
             }
-            let Ok(manifest) = fs::read_to_string(app_root.join("manifest.toml")) else {
+            let Ok(manifest) = read_to_string(app_root.join("manifest.toml")) else {
                 continue;
             };
             let (Some(id), Some(name)) = (
@@ -648,15 +674,62 @@ fn load_applications() -> HashMap<String, ApplicationPresentation> {
             } else {
                 format!("{name}.app")
             };
-            let icon = manifest_string(&manifest, "icon")
-                .map(|relative| app_root.join(relative))
-                .and_then(|path| load_icon(&path));
+            let icon = manifest_string(&manifest, "icon").map(|relative| app_root.join(relative));
             applications
                 .entry(id)
                 .or_insert(ApplicationPresentation { name, icon });
         }
     }
     applications
+}
+
+fn read_directory_entries(root: &Path) -> io::Result<Vec<fs::DirEntry>> {
+    let mut last_error = None;
+    for _ in 0..8 {
+        match fs::read_dir(root) {
+            Ok(entries) => return entries.collect(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                last_error = Some(error);
+                transient_pause();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    fs::read_dir(root)
+        .and_then(|entries| entries.collect())
+        .or_else(|error| Err(last_error.unwrap_or(error)))
+}
+
+fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
+    let path = path.as_ref();
+    let mut last_error = None;
+    for _ in 0..8 {
+        match fs::read_to_string(path) {
+            Ok(content) => return Ok(content),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                last_error = Some(error);
+                transient_pause();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    fs::read_to_string(path).or_else(|error| Err(last_error.unwrap_or(error)))
+}
+
+fn transient_pause() {
+    for _ in 0..256 {
+        core::hint::spin_loop();
+    }
 }
 
 fn manifest_string(manifest: &str, key: &str) -> Option<String> {
