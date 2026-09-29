@@ -158,10 +158,11 @@ impl MonitorView {
                 let application_name = self
                     .applications
                     .get(&item.name)
-                    .map(|application| application.name.to_lowercase());
+                    .map(|application| application.name.to_lowercase())
+                    .unwrap_or_else(|| fallback_process_name(&item.name).to_lowercase());
                 query.is_empty()
                     || item.name.to_lowercase().contains(&query)
-                    || application_name.is_some_and(|name| name.contains(&query))
+                    || application_name.contains(&query)
                     || item.pid.to_string().contains(&query)
             })
             .cloned()
@@ -175,13 +176,13 @@ impl MonitorView {
             let left_name = self
                 .applications
                 .get(&left.name)
-                .map(|application| application.name.as_str())
-                .unwrap_or(&left.name);
+                .map(|application| application.name.clone())
+                .unwrap_or_else(|| fallback_process_name(&left.name));
             let right_name = self
                 .applications
                 .get(&right.name)
-                .map(|application| application.name.as_str())
-                .unwrap_or(&right.name);
+                .map(|application| application.name.clone())
+                .unwrap_or_else(|| fallback_process_name(&right.name));
             category_order
                 .then_with(|| left_name.to_lowercase().cmp(&right_name.to_lowercase()))
                 .then(left.pid.cmp(&right.pid))
@@ -345,9 +346,10 @@ impl MonitorView {
             }
 
             let presentation = self.applications.get(&process.name);
+            let fallback_name = fallback_process_name(&process.name);
             let display_name = presentation
                 .map(|application| application.name.as_str())
-                .unwrap_or(&process.name);
+                .unwrap_or(&fallback_name);
             let icon_bounds = Rect::new(table.origin.x + 20.0, y + 8.0, 27.0, 27.0);
             if let Some(icon) = presentation.and_then(|application| application.icon.clone()) {
                 Image::new(icon)
@@ -473,7 +475,7 @@ impl View for MonitorView {
                             self.applications
                                 .get(&process.name)
                                 .map(|application| application.name.clone())
-                                .unwrap_or_else(|| process.name.clone())
+                                .unwrap_or_else(|| fallback_process_name(&process.name))
                         })
                         .unwrap_or_else(|| "No processes".to_owned()),
                 ),
@@ -640,6 +642,12 @@ fn load_applications() -> HashMap<String, ApplicationPresentation> {
             ) else {
                 continue;
             };
+            let bundle_name = entry.file_name().to_string_lossy().into_owned();
+            let name = if bundle_name.ends_with(".app") {
+                bundle_name
+            } else {
+                format!("{name}.app")
+            };
             let icon = manifest_string(&manifest, "icon")
                 .map(|relative| app_root.join(relative))
                 .and_then(|path| load_icon(&path));
@@ -691,4 +699,16 @@ fn energy_impact(cpu_percent: f32) -> &'static str {
     } else {
         "Low"
     }
+}
+
+fn fallback_process_name(name: &str) -> String {
+    if name.ends_with(".app") || name.ends_with(".service") || name.ends_with(".driver") {
+        return name.to_owned();
+    }
+    if (name.starts_with("org.") || name.starts_with("com.") || name.starts_with("net."))
+        && let Some(component) = name.rsplit('.').next()
+    {
+        return format!("{component}.app");
+    }
+    name.to_owned()
 }
