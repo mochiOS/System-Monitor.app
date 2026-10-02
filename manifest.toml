@@ -18,7 +18,7 @@ icon = "appicon.png"
 resources = ["appicon.png"]
 
 [[binary]]
-path = "/applications/SystemMonitor.app/entry.elf"
+path = "/system/applications/SystemMonitor.app/entry.elf"
 kind = "application"
 requires = [
     "fs.read.applications",

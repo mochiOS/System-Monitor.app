@@ -18,7 +18,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const KERNEL_TICKS_PER_SECOND: f32 = 500.0;
 const ROW_HEIGHT: f32 = 43.0;
 const HEADER_HEIGHT: f32 = 38.0;
-const FALLBACK_APPLICATION_ICON: &str = "/applications/Binder.app/appicon.svg";
+const FALLBACK_APPLICATION_ICON: &str = "/system/applications/Binder.app/appicon.svg";
 
 struct SystemMonitorApp {
     category: State<usize>,
