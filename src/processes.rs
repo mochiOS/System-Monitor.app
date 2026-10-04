@@ -158,14 +158,14 @@ pub fn snapshot() -> io::Result<Vec<ProcessInfo>> {
 pub fn uptime_seconds() -> Option<u64> {
     use mochi_user_syscall as syscall;
 
-    let mut timespec = [0i64; 2];
+    let mut instant = syscall::ClockInstant::default();
     syscall::call2(
-        syscall::SyscallNumber::ClockGettime,
-        1,
-        timespec.as_mut_ptr() as u64,
+        syscall::SyscallNumber::ClockRead,
+        syscall::ClockId::Monotonic as u64,
+        (&mut instant as *mut syscall::ClockInstant) as u64,
     )
     .ok()?;
-    u64::try_from(timespec[0]).ok()
+    (instant.nanoseconds < 1_000_000_000 && instant.reserved == 0).then_some(instant.seconds)
 }
 
 #[cfg(not(target_os = "mochios"))]
