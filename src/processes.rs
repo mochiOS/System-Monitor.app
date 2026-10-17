@@ -82,6 +82,16 @@ pub fn decode_records(bytes: &[u8], count: usize) -> Vec<ProcessInfo> {
 }
 
 #[cfg(target_os = "mochios")]
+fn inspection_error(error: mochi_user_syscall::SysError) -> io::Error {
+    use mochi_user_syscall::NativeError;
+    match error.native_error() {
+        Some(NativeError::AccessDenied) => io::ErrorKind::PermissionDenied.into(),
+        Some(NativeError::ResourceUnavailable) => io::ErrorKind::OutOfMemory.into(),
+        _ => io::Error::from_raw_os_error(error.errno().unwrap_or(5).min(i32::MAX as u64) as i32),
+    }
+}
+
+#[cfg(target_os = "mochios")]
 pub fn snapshot() -> io::Result<Vec<ProcessInfo>> {
     use mochi_user_syscall as syscall;
 
@@ -91,9 +101,7 @@ pub fn snapshot() -> io::Result<Vec<ProcessInfo>> {
         records.as_mut_ptr() as u64,
         records.len() as u64,
     )
-    .map_err(|error| {
-        io::Error::from_raw_os_error(error.errno().unwrap_or(5).min(i32::MAX as u64) as i32)
-    })?;
+    .map_err(inspection_error)?;
     Ok(decode_records(&records, (count as usize).min(MAX_RECORDS)))
 }
 
