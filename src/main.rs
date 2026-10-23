@@ -4,11 +4,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use appcore::prelude::*;
-use appcore::viewkit::draw_command::ImageSampling;
+use appcore::viewkit::draw_command::{DrawCommand, ImageSampling};
 use appcore::viewkit::event::{EventContext, EventResult, ViewEvent};
 use appcore::viewkit::platform::PointerButton;
 use appcore::viewkit::view::{Constraints, MeasureContext, PaintContext};
@@ -16,13 +18,15 @@ use processes::{ProcessInfo, ProcessState};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const KERNEL_TICKS_PER_SECOND: f32 = 500.0;
-const ROW_HEIGHT: f32 = 43.0;
-const HEADER_HEIGHT: f32 = 38.0;
+const ROW_HEIGHT: f32 = 34.0;
+const HEADER_HEIGHT: f32 = 30.0;
 const FALLBACK_APPLICATION_ICON: &str = "/system/applications/Binder.app/appicon.svg";
 
 struct SystemMonitorApp {
     category: State<usize>,
     search: State<String>,
+    model: Rc<MonitorModel>,
+    category_interaction: SegmentedControlInteractionState,
 }
 
 impl App for SystemMonitorApp {
@@ -32,6 +36,8 @@ impl App for SystemMonitorApp {
         Self {
             category: State::new(0),
             search: State::new(String::new()),
+            model: Rc::new(MonitorModel::new()),
+            category_interaction: SegmentedControlInteractionState::new(),
         }
     }
 
@@ -46,40 +52,93 @@ impl App for SystemMonitorApp {
             VStack::new()
                 .alignment(StackAlignment::Stretch)
                 .gap(StackGap::None)
-                .child(
-                    Padding::symmetric(20.0, 15.0)
-                        .content(
-                            HStack::new()
-                                .alignment(StackAlignment::Center)
-                                .child(
-                                    SegmentedControl::new(self.category.binding())
-                                        .item(0, "CPU")
-                                        .item(1, "Memory")
-                                        .item(2, "Energy")
-                                        .item(3, "Disk")
-                                        .item(4, "Network")
-                                        .frame(386.0, 32.0),
-                                )
-                                .child(Spacer::new())
-                                .child(
-                                    TextField::new(self.search.binding())
-                                        .placeholder("Search")
-                                        .leading_symbol(SymbolName::Search)
-                                        .size(TextFieldSize::Small)
-                                        .frame(206.0, 32.0),
-                                ),
-                        )
-                        .height(62.0),
-                )
+                .child(Toolbar::new(MonitorToolbar {
+                    category: SegmentedControl::with_interaction(
+                        self.category.binding(),
+                        self.category_interaction.clone(),
+                    )
+                    .item(0, "CPU")
+                    .item(1, "Memory")
+                    .item(2, "Energy")
+                    .item(3, "Disk")
+                    .item(4, "Network"),
+                    search: TextField::new(self.search.binding())
+                        .placeholder("Name or PID")
+                        .leading_symbol(SymbolName::Search)
+                        .size(TextFieldSize::Small),
+                }))
                 .child(Divider::new())
                 .child(
-                    MonitorView::new(self.category.clone(), self.search.clone())
-                        .layout()
-                        .flex_grow(1.0),
+                    MonitorView::new(
+                        self.category.clone(),
+                        self.search.clone(),
+                        self.model.clone(),
+                    )
+                    .layout()
+                    .flex_grow(1.0),
                 ),
         );
 
         content
+    }
+}
+
+// A layout wrapper around native controls; narrow windows keep search reachable.
+struct MonitorToolbar {
+    category: SegmentedControl,
+    search: TextField,
+}
+impl MonitorToolbar {
+    fn frames(bounds: Rect) -> (Rect, Rect) {
+        if bounds.size.width < 590.0 {
+            (
+                Rect::new(bounds.origin.x, bounds.origin.y, bounds.size.width, 28.0),
+                Rect::new(
+                    bounds.origin.x,
+                    bounds.origin.y + 36.0,
+                    bounds.size.width,
+                    28.0,
+                ),
+            )
+        } else {
+            (
+                Rect::new(bounds.origin.x, bounds.origin.y, 360.0, 28.0),
+                Rect::new(
+                    bounds.origin.x + bounds.size.width - 206.0,
+                    bounds.origin.y,
+                    206.0,
+                    28.0,
+                ),
+            )
+        }
+    }
+}
+impl View for MonitorToolbar {
+    fn measure(&self, constraints: Constraints, _: &mut MeasureContext<'_>) -> Size {
+        constraints.constrain(Size::new(
+            constraints.maximum.width,
+            if constraints.maximum.width < 590.0 {
+                64.0
+            } else {
+                28.0
+            },
+        ))
+    }
+    fn paint(&self, bounds: Rect, context: &mut PaintContext<'_>) {
+        let (category, search) = Self::frames(bounds);
+        self.category.paint(category, context);
+        self.search.paint(search, context);
+    }
+    fn handle_event(
+        &self,
+        bounds: Rect,
+        event: &ViewEvent,
+        context: &mut EventContext<'_>,
+    ) -> EventResult {
+        let (category, search) = Self::frames(bounds);
+        self.category
+            .handle_event(category, event, context)
+            .merge(self.search.handle_event(search, event, context))
     }
 }
 
@@ -92,6 +151,17 @@ struct ApplicationPresentation {
 struct MonitorView {
     category: State<usize>,
     search: State<String>,
+    model: Rc<MonitorModel>,
+}
+
+impl Deref for MonitorView {
+    type Target = MonitorModel;
+    fn deref(&self) -> &MonitorModel {
+        &self.model
+    }
+}
+
+struct MonitorModel {
     applications: RefCell<HashMap<String, ApplicationPresentation>>,
     icon_cache: RefCell<HashMap<PathBuf, ImageData>>,
     processes: RefCell<Vec<ProcessInfo>>,
@@ -99,13 +169,12 @@ struct MonitorView {
     last_refresh: Cell<Option<Instant>>,
     selected_pid: Cell<Option<u64>>,
     scroll_rows: Cell<usize>,
+    filter_key: RefCell<(usize, String)>,
 }
 
-impl MonitorView {
-    fn new(category: State<usize>, search: State<String>) -> Self {
+impl MonitorModel {
+    fn new() -> Self {
         Self {
-            category,
-            search,
             applications: RefCell::new(load_applications()),
             icon_cache: RefCell::new(HashMap::new()),
             processes: RefCell::new(Vec::new()),
@@ -113,6 +182,17 @@ impl MonitorView {
             last_refresh: Cell::new(None),
             selected_pid: Cell::new(None),
             scroll_rows: Cell::new(0),
+            filter_key: RefCell::new((0, String::new())),
+        }
+    }
+}
+
+impl MonitorView {
+    fn new(category: State<usize>, search: State<String>, model: Rc<MonitorModel>) -> Self {
+        Self {
+            category,
+            search,
+            model,
         }
     }
 
@@ -150,14 +230,16 @@ impl MonitorView {
             }
             self.last_refresh.set(Some(now));
         }
-        context.request_redraw_in_at(
-            Rect::new(bounds.origin.x, bounds.origin.y, 1.0, 1.0),
-            now + REFRESH_INTERVAL,
-        );
+        context.request_redraw_in_at(bounds, now + REFRESH_INTERVAL);
     }
 
     fn filtered(&self) -> Vec<ProcessInfo> {
         let query = self.search.get().trim().to_lowercase();
+        let key = (self.category.get(), query.clone());
+        if *self.filter_key.borrow() != key {
+            *self.filter_key.borrow_mut() = key;
+            self.scroll_rows.set(0);
+        }
         let mut processes = self
             .processes
             .borrow()
@@ -202,19 +284,31 @@ impl MonitorView {
     }
 
     fn geometry(bounds: Rect) -> (Rect, Rect) {
+        let inset = Theme::current().spacing.extra_large;
         let content = Rect::new(
-            bounds.origin.x + 20.0,
-            bounds.origin.y + 18.0,
-            (bounds.size.width - 40.0).max(0.0),
-            (bounds.size.height - 18.0).max(0.0),
+            bounds.origin.x + inset,
+            bounds.origin.y + inset,
+            (bounds.size.width - inset * 2.0).max(0.0),
+            (bounds.size.height - inset).max(0.0),
         );
         let table = Rect::new(
             content.origin.x,
-            content.origin.y + 118.0,
+            content.origin.y + 120.0,
             content.size.width,
-            (content.size.height - 154.0).max(0.0),
+            (content.size.height - 150.0).max(0.0),
         );
         (content, table)
+    }
+
+    fn visible_rows(table: Rect) -> usize {
+        ((table.size.height - HEADER_HEIGHT).max(0.0) / ROW_HEIGHT).floor() as usize
+    }
+
+    fn scroll_start(&self, table: Rect, count: usize) -> usize {
+        let maximum = count.saturating_sub(Self::visible_rows(table).max(1));
+        let start = self.scroll_rows.get().min(maximum);
+        self.scroll_rows.set(start);
+        start
     }
 
     fn uptime() -> String {
@@ -243,30 +337,30 @@ impl MonitorView {
             .color(theme.shell.secondary_text)
             .paint(
                 Rect::new(
-                    bounds.origin.x + 16.0,
-                    bounds.origin.y + 10.0,
-                    bounds.size.width - 32.0,
+                    bounds.origin.x + 12.0,
+                    bounds.origin.y + 6.0,
+                    (bounds.size.width - 24.0).max(0.0),
                     22.0,
                 ),
                 context,
             );
-        Text::styled(value, TextRole::TitleLarge)
+        Text::styled(value, TextRole::TitleMedium)
             .weight(500)
             .color(theme.shell.primary_text)
             .paint(
                 Rect::new(
-                    bounds.origin.x + 16.0,
+                    bounds.origin.x + 12.0,
                     bounds.origin.y + 35.0,
-                    bounds.size.width - 32.0,
+                    (bounds.size.width - 24.0).max(0.0),
                     32.0,
                 ),
                 context,
             );
         Text::metadata(detail).paint(
             Rect::new(
-                bounds.origin.x + 16.0,
+                bounds.origin.x + 12.0,
                 bounds.origin.y + 68.0,
-                bounds.size.width - 32.0,
+                (bounds.size.width - 24.0).max(0.0),
                 20.0,
             ),
             context,
@@ -294,7 +388,6 @@ impl MonitorView {
         );
         Rectangle::new()
             .color(RectangleColor::Custom(theme.shell.item_enabled))
-            .radius(CornerRadius::Large)
             .paint(header, context);
 
         let widths = [0.37, 0.12, 0.14, 0.11, 0.10, 0.16];
@@ -319,13 +412,23 @@ impl MonitorView {
             ],
             _ => ["Process Name", "% CPU", "Memory", "Threads", "PID", "State"],
         };
-        let mut x = table.origin.x + 20.0;
+        let mut x = table.origin.x;
         for (index, heading) in headings.into_iter().enumerate() {
             let width = table.size.width * widths[index];
             Text::styled(heading, TextRole::Caption)
+                .alignment(if (1..=4).contains(&index) {
+                    TextAlignment::End
+                } else {
+                    TextAlignment::Start
+                })
                 .color(theme.shell.secondary_text)
                 .paint(
-                    Rect::new(x, header.origin.y + 9.0, width - 20.0, 20.0),
+                    Rect::new(
+                        x + 12.0,
+                        header.origin.y + 5.0,
+                        (width - 24.0).max(0.0),
+                        20.0,
+                    ),
                     context,
                 );
             x += width;
@@ -353,10 +456,15 @@ impl MonitorView {
             return;
         }
 
-        let visible = ((table.size.height - HEADER_HEIGHT) / ROW_HEIGHT)
-            .floor()
-            .max(1.0) as usize;
-        let start = self.scroll_rows.get().min(filtered.len().saturating_sub(1));
+        let visible = Self::visible_rows(table);
+        let start = self.scroll_start(table, filtered.len());
+        context
+            .display_list
+            .push(DrawCommand::PushClip { rect: table });
+        context.record_accessibility(appcore::viewkit::accessibility::AccessibilityNode::new(
+            appcore::viewkit::accessibility::AccessibilityRole::List,
+            table,
+        ));
         for (row_index, process) in filtered.iter().skip(start).take(visible).enumerate() {
             let y = table.origin.y + HEADER_HEIGHT + row_index as f32 * ROW_HEIGHT;
             let row = Rect::new(table.origin.x, y + 2.0, table.size.width, ROW_HEIGHT - 4.0);
@@ -367,13 +475,37 @@ impl MonitorView {
                     .paint(row, context);
             }
 
+            Rectangle::new()
+                .color(RectangleColor::Custom(theme.colors.border))
+                .paint(
+                    Rect::new(
+                        table.origin.x + 12.0,
+                        y + ROW_HEIGHT - 1.0,
+                        (table.size.width - 24.0).max(0.0),
+                        1.0,
+                    ),
+                    context,
+                );
             let presentation = self.applications.borrow().get(&process.name).cloned();
             let fallback_name = fallback_process_name(&process.name);
             let display_name = presentation
                 .as_ref()
                 .map(|application| application.name.as_str())
                 .unwrap_or(&fallback_name);
-            let icon_bounds = Rect::new(table.origin.x + 20.0, y + 8.0, 27.0, 27.0);
+            let mut node = appcore::viewkit::accessibility::AccessibilityNode::new(
+                appcore::viewkit::accessibility::AccessibilityRole::ListItem,
+                row,
+            );
+            node.label = Some(format!(
+                "{display_name}, PID {}, {:.1}% CPU, {}, {}",
+                process.pid,
+                process.cpu_percent,
+                format_bytes(process.memory_bytes),
+                process.state.label()
+            ));
+            node.selected = self.selected_pid.get() == Some(process.pid);
+            context.record_accessibility(node);
+            let icon_bounds = Rect::new(table.origin.x + 12.0, y + 6.0, 22.0, 22.0);
             let icon = presentation
                 .as_ref()
                 .and_then(|application| application.icon.as_deref())
@@ -394,9 +526,9 @@ impl MonitorView {
                 })
                 .paint(
                     Rect::new(
-                        table.origin.x + 57.0,
-                        y + 10.0,
-                        table.size.width * widths[0] - 77.0,
+                        table.origin.x + 44.0,
+                        y + 6.0,
+                        table.size.width * widths[0] - 56.0,
                         22.0,
                     ),
                     context,
@@ -417,15 +549,25 @@ impl MonitorView {
                 process.pid.to_string(),
                 process.state.label().to_owned(),
             ];
-            let mut x = table.origin.x + 20.0 + table.size.width * widths[0];
+            let mut x = table.origin.x + table.size.width * widths[0];
             for (offset, value) in values.into_iter().enumerate() {
                 let index = offset + 1;
                 let width = table.size.width * widths[index];
                 let state_inset = if index == 5 { 16.0 } else { 0.0 };
                 Text::styled(value, TextRole::Label)
+                    .alignment(if index < 5 {
+                        TextAlignment::End
+                    } else {
+                        TextAlignment::Start
+                    })
                     .color(theme.shell.primary_text)
                     .paint(
-                        Rect::new(x + state_inset, y + 10.0, width - 20.0, 22.0),
+                        Rect::new(
+                            x + 12.0 + state_inset,
+                            y + 6.0,
+                            (width - 24.0 - state_inset).max(0.0),
+                            22.0,
+                        ),
                         context,
                     );
                 x += width;
@@ -433,19 +575,46 @@ impl MonitorView {
             let state_x = table.origin.x + table.size.width * widths[..5].iter().sum::<f32>();
             Ellipse::new()
                 .color(EllipseColor::Custom(match process.state {
-                    ProcessState::Running => Color::from_rgb_hex(0x2eae7b),
-                    ProcessState::Sleeping => Color::from_rgb_hex(0xaeb4bd),
+                    ProcessState::Running => theme.shell.action,
+                    ProcessState::Sleeping => theme.shell.tertiary_text,
                     ProcessState::Zombie => theme.shell.alert,
                     ProcessState::Unknown(_) => theme.shell.tertiary_text,
                 }))
-                .paint(Rect::new(state_x + 2.0, y + 17.0, 7.0, 7.0), context);
+                .paint(Rect::new(state_x + 12.0, y + 14.0, 7.0, 7.0), context);
         }
 
-        Text::metadata(format!("{} processes", filtered.len())).paint(
+        if filtered.len() > visible && visible > 0 {
+            let track_height = (table.size.height - HEADER_HEIGHT).max(0.0);
+            let thumb_height = (track_height * visible as f32 / filtered.len() as f32)
+                .max(18.0)
+                .min(track_height);
+            let travel = track_height - thumb_height;
+            let offset =
+                start as f32 / filtered.len().saturating_sub(visible).max(1) as f32 * travel;
+            Rectangle::new()
+                .color(RectangleColor::Custom(theme.shell.tertiary_text))
+                .radius(CornerRadius::Full)
+                .paint(
+                    Rect::new(
+                        table.origin.x + table.size.width - 4.0,
+                        table.origin.y + HEADER_HEIGHT + offset,
+                        3.0,
+                        thumb_height,
+                    ),
+                    context,
+                );
+        }
+        context.display_list.push(DrawCommand::PopClip);
+        Text::metadata(format!(
+            "{} of {} processes · Updated every second",
+            filtered.len(),
+            self.processes.borrow().len()
+        ))
+        .paint(
             Rect::new(
                 table.origin.x + 18.0,
                 table.origin.y + table.size.height + 7.0,
-                180.0,
+                table.size.width,
                 22.0,
             ),
             context,
@@ -483,7 +652,11 @@ impl View for MonitorView {
             .filter(|process| process.state == ProcessState::Running)
             .count();
         let largest = processes.iter().max_by_key(|process| process.memory_bytes);
-        let gap = 20.0;
+        Surface::pane().paint(
+            Rect::new(content.origin.x, content.origin.y, content.size.width, 96.0),
+            context,
+        );
+        let gap = 0.0;
         let width = (content.size.width - gap * 3.0) / 4.0;
         let cards = match self.category.get() {
             1 => vec![
@@ -589,6 +762,19 @@ impl View for MonitorView {
         };
         drop(processes);
         for (index, (label, value, detail)) in cards.into_iter().enumerate() {
+            if index > 0 {
+                Rectangle::new()
+                    .color(RectangleColor::Custom(Theme::current().colors.border))
+                    .paint(
+                        Rect::new(
+                            content.origin.x + index as f32 * width,
+                            content.origin.y + 16.0,
+                            1.0,
+                            64.0,
+                        ),
+                        context,
+                    );
+            }
             Self::card(
                 Rect::new(
                     content.origin.x + index as f32 * (width + gap),
@@ -602,6 +788,22 @@ impl View for MonitorView {
                 context,
             );
         }
+        let notice = self.error.borrow().as_ref().map(|error| format!("Could not refresh: {error}. Showing the last available snapshot."))
+            .unwrap_or_else(|| match self.category.get() {
+                2 => "Energy impact is estimated from CPU activity; power consumption is not measured.".into(),
+                3 => "Per-process disk activity is not available yet.".into(),
+                4 => "Per-process network activity is not available yet.".into(),
+                _ => "Processes · Highest usage first".into(),
+            });
+        Text::metadata(notice).paint(
+            Rect::new(
+                content.origin.x + 12.0,
+                content.origin.y + 98.0,
+                (content.size.width - 24.0).max(0.0),
+                20.0,
+            ),
+            context,
+        );
         self.paint_table(table, context);
     }
 
@@ -619,7 +821,11 @@ impl View for MonitorView {
                 button: PointerButton::Primary,
             } if table.contains(*position) && position.y >= table.origin.y + HEADER_HEIGHT => {
                 let row = ((position.y - table.origin.y - HEADER_HEIGHT) / ROW_HEIGHT) as usize;
-                if let Some(process) = filtered.get(self.scroll_rows.get() + row) {
+                if row >= Self::visible_rows(table) {
+                    return EventResult::Ignored;
+                }
+                if let Some(process) = filtered.get(self.scroll_start(table, filtered.len()) + row)
+                {
                     self.selected_pid.set(Some(process.pid));
                     context.request_redraw_in(table);
                 }
@@ -628,8 +834,10 @@ impl View for MonitorView {
             ViewEvent::Scroll {
                 position, delta_y, ..
             } if table.contains(*position) => {
-                let maximum = filtered.len().saturating_sub(1);
-                let current = self.scroll_rows.get();
+                let maximum = filtered
+                    .len()
+                    .saturating_sub(Self::visible_rows(table).max(1));
+                let current = self.scroll_start(table, filtered.len());
                 let next = if *delta_y < 0.0 {
                     current.saturating_add(3).min(maximum)
                 } else {
@@ -823,4 +1031,95 @@ fn fallback_process_name(name: &str) -> String {
         return format!("{component}.app");
     }
     name.to_owned()
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use appcore::viewkit::{
+        draw_command::DisplayList, typography::TextMeasurer, view::RedrawSchedule,
+    };
+
+    fn model() -> Rc<MonitorModel> {
+        let model = Rc::new(MonitorModel::new());
+        *model.processes.borrow_mut() = (1..=100)
+            .map(|pid| ProcessInfo {
+                pid,
+                name: format!("worker-{pid}"),
+                state: ProcessState::Sleeping,
+                cpu_ticks: pid,
+                cpu_percent: pid as f32,
+                memory_bytes: pid * 1024,
+                thread_count: 1,
+            })
+            .collect();
+        model.last_refresh.set(Some(Instant::now()));
+        model
+    }
+
+    #[test]
+    fn rebuilding_after_search_preserves_snapshot_and_selection_but_resets_scroll() {
+        let model = model();
+        let category = State::new(0);
+        let search = State::new(String::new());
+        let view = MonitorView::new(category.clone(), search.clone(), model.clone());
+        model.selected_pid.set(Some(99));
+        model.scroll_rows.set(50);
+        assert_eq!(view.filtered().len(), 100);
+        search.set("worker-99".into());
+        let rebuilt = MonitorView::new(category.clone(), search, model.clone());
+        let filtered = rebuilt.filtered();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pid, 99);
+        assert_eq!(model.selected_pid.get(), Some(99));
+        assert_eq!(model.scroll_rows.get(), 0);
+        assert_eq!(model.processes.borrow().len(), 100);
+        category.set(1);
+        assert_eq!(rebuilt.filtered()[0].pid, 99);
+        assert_eq!(model.processes.borrow()[98].cpu_percent, 99.0);
+    }
+
+    #[test]
+    fn scrolling_fills_last_page_and_shrinking_results_clamps_the_start() {
+        let view = MonitorView::new(State::new(0), State::new(String::new()), model());
+        let table = Rect::new(0.0, 0.0, 900.0, HEADER_HEIGHT + ROW_HEIGHT * 10.0);
+        view.scroll_rows.set(999);
+        assert_eq!(view.scroll_start(table, 100), 90);
+        assert_eq!(view.scroll_start(table, 3), 0);
+        assert_eq!(
+            MonitorView::visible_rows(Rect::new(0.0, 0.0, 200.0, 10.0)),
+            0
+        );
+    }
+
+    #[test]
+    fn paint_explains_unavailable_metrics_and_retains_refresh_errors_with_data() {
+        let model = model();
+        let category = State::new(4);
+        let view = MonitorView::new(category.clone(), State::new(String::new()), model.clone());
+        let theme = Theme::current();
+        let mut measurer = TextMeasurer::new();
+        let mut list = DisplayList::new();
+        let mut schedule = RedrawSchedule::new();
+        let bounds = Rect::new(0.0, 0.0, 1000.0, 600.0);
+        view.paint(
+            bounds,
+            &mut PaintContext::new(&mut list, &theme, &theme.typography, &mut measurer)
+                .with_redraw_schedule(&mut schedule),
+        );
+        assert!(list.commands().iter().any(|command| matches!(command,
+            DrawCommand::DrawText { command } if command.text.contains("network activity is not available"))));
+        assert!(schedule.deadline().is_some());
+        *model.error.borrow_mut() = Some("Inspection denied".into());
+        category.set(0);
+        list.clear();
+        view.paint(
+            bounds,
+            &mut PaintContext::new(&mut list, &theme, &theme.typography, &mut measurer),
+        );
+        assert!(list.commands().iter().any(|command| matches!(command,
+            DrawCommand::DrawText { command } if command.text.contains("Inspection denied"))));
+        assert!(list.commands().iter().any(|command| matches!(command,
+            DrawCommand::DrawText { command } if command.text == "worker-100")));
+    }
 }
