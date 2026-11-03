@@ -1045,6 +1045,7 @@ dependencies = [
  "mnu-abi",
  "mochi-user-syscall",
  "mochios-capability-protocol",
+ "mochios-package-manifest",
  "mochios-workspace-protocol",
 ]
 
@@ -1098,6 +1099,13 @@ dependencies = [
 [[package]]
 name = "mochios-net-device-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "mochios-package-manifest"
+version = "0.1.0"
+dependencies = [
+ "toml",
+]
 
 [[package]]
 name = "mochios-posix-client"
