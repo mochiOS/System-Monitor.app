@@ -7,7 +7,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-appcore = { package = "mochios-appcore", path = "../../tools/devkit/crates/appcore" }
+appcore = { package = "mochios-appcore", git = "https://github.com/mochiOS/devkit" }
 
 [target.'cfg(target_os = "mochios")'.dependencies]
 mochi-user-syscall = { git = "https://github.com/mochiOS/syscalls", package = "mochi-user-syscall" }
